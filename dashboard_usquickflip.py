@@ -43,11 +43,56 @@ def _write_csv(records):
             w.writerow({k: r.get(k, "") for k in qf.CSV_COLUMNS})
 
 
+def _read_csv():
+    """Previously-logged rows keyed by date (empty on first run / read error)."""
+    if not LOG_CSV.exists():
+        return {}
+    out = {}
+    try:
+        with open(LOG_CSV, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                d = (row.get("date") or "").strip()
+                if d:
+                    out[d] = {k: row.get(k, "") for k in qf.CSV_COLUMNS}
+    except Exception as exc:
+        log.warning("could not read existing log: %s", exc)
+        return {}
+    return out
+
+
+def _merge(recs):
+    """Persist resolved forward-test outcomes.
+
+    yfinance intraday history is gappy: a later fetch can return too few 5-min bars
+    for an already-resolved day, which would recompute it as NO_SETUP and silently
+    drop its WIN/LOSS + P&L from the CSV and the running stats. So we keep any prior
+    WIN/LOSS row (and its pnl) whenever the fresh recompute degrades it, and retain
+    resolved days that have slid out of the ~60-day 5-min fetch window entirely.
+    A fresh WIN/LOSS always wins (a still-PENDING row gets updated on resolution)."""
+    prev = _read_csv()
+    resolved = ("WIN", "LOSS")
+    merged, seen = [], set()
+    for r in recs:
+        d = r.get("date")
+        seen.add(d)
+        p = prev.get(d)
+        if p and p.get("outcome") in resolved and r.get("outcome") not in resolved:
+            merged.append(p)          # keep the persisted resolved outcome
+        else:
+            merged.append(r)          # fresh row (incl. PENDING -> WIN/LOSS updates)
+    for d, p in prev.items():         # resolved days that fell out of the fetch window
+        if d not in seen and p.get("outcome") in resolved:
+            merged.append(p)
+    merged.sort(key=lambda r: r.get("date", ""))
+    return merged
+
+
 def refresh():
     try:
         now = datetime.now(timezone.utc)
         daily, five = qf.fetch()
         recs = qf.build_records(daily, five, now_utc=now)
+        recs = _merge(recs)
         st = qf.stats(recs)
         today_est = None
         try:
@@ -183,7 +228,7 @@ border-radius:8px;padding:12px;margin-top:12px;display:none;color:var(--tx);}
 <header>
   <div class="brand">USQUICKFLIP <small>v__VER__ &middot; port 5009 &middot; US500 shadow collector &middot; Commission 011</small></div>
   <div style="display:flex;gap:10px;align-items:center;">
-    <button class="navbtn" onclick="brief()">ARCHIE BRIEF</button>
+    <button class="navbtn" id="copybtn" onclick="brief()">ARCHIE BRIEF</button>
     <div class="clock" id="clk">--:--:-- UTC</div>
   </div>
 </header>
@@ -243,9 +288,27 @@ function load(){
   document.getElementById('logtbl').innerHTML=tb;
  }).catch(function(e){});
 }
+function fallbackCopy(t){
+ try{var ta=document.createElement('textarea');ta.value=t;
+  ta.style.position='fixed';ta.style.top='-1000px';ta.style.opacity='0';
+  document.body.appendChild(ta);ta.focus();ta.select();
+  var ok=document.execCommand('copy');document.body.removeChild(ta);return ok;
+ }catch(e){return false;}
+}
+function copyText(t){
+ if(navigator.clipboard&&navigator.clipboard.writeText){
+  return navigator.clipboard.writeText(t).then(function(){return true;},function(){return fallbackCopy(t);});
+ }
+ return Promise.resolve(fallbackCopy(t));
+}
+function flash(msg){var b=document.getElementById('copybtn');if(!b)return;
+ var o=b.getAttribute('data-lbl')||b.textContent;b.setAttribute('data-lbl',o);
+ b.textContent=msg;setTimeout(function(){b.textContent=o;},1500);}
 function brief(){var el=document.getElementById('brief');
- if(el.style.display==='block'){el.style.display='none';return;}
- fetch('/api/archie-brief').then(function(r){return r.text();}).then(function(t){el.textContent=t;el.style.display='block';});
+ fetch('/api/archie-brief').then(function(r){return r.text();}).then(function(t){
+  el.textContent=t;el.style.display='block';
+  copyText(t).then(function(ok){flash(ok?'COPIED':'COPY FAILED');});
+ }).catch(function(e){flash('FETCH FAILED');});
 }
 load();setInterval(load,15000);
 </script>
